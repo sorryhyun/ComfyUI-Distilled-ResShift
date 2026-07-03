@@ -1,0 +1,17 @@
+[project]
+name = "comfyui-distilled-resshift"
+description = "Distilled 1-step ResShift ×4 super-resolution as a pixel-space IMAGE -> IMAGE node. A ResShift student (distilled from a 15-step teacher, paper 22490) upsamples any RGB image ×4 in one stochastic step. Self-contained vendored ResShift net (no xformers needed on any GPU); student + vq-f4 VQGAN auto-download on first use."
+version = "0.1.0"
+license = { file = "LICENSE" }
+
+[project.urls]
+Repository = "https://github.com/sorryhyun/ComfyUI-Distilled-ResShift"
+# Distilled student weights (auto-downloaded):
+Weights = "https://huggingface.co/sorryhyun/Distilled-ResShift-4x"
+# Upstream ResShift network (vendored under _vendor/resshift/, S-Lab license):
+Source = "https://github.com/zsyOAOA/ResShift"
+
+[tool.comfy]
+PublisherId = "sorryhyun"
+DisplayName = "Distilled ResShift SR (×4, 1-step)"
+Icon = ""
