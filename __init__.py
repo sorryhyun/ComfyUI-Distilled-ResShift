@@ -1,15 +1,17 @@
-"""Distilled ResShift ×4 super-resolution ComfyUI custom nodes.
+"""Distilled ResShift super-resolution ComfyUI custom nodes (×4 or ×2).
 
 A 1-step ResShift student (distilled from a 15-step teacher, paper 22490) as a
-pixel-space IMAGE -> IMAGE ×4 upscaler. Drop it after VAEDecode / SaveImage — it is
-model-agnostic (works on any RGB image, not just Anima output).
+pixel-space IMAGE -> IMAGE upscaler. The Loader's ``scale`` dropdown picks ×4 or ×2
+(same arch + VQGAN, only the diffusion sf differs). Drop it after VAEDecode / SaveImage
+— it is model-agnostic (works on any RGB image, not just Anima output).
 
 * ``ResShiftLoader``  — load the RSD student + vq-f4 VQGAN -> ``RESSHIFT_MODEL`` socket.
-* ``ResShiftUpscale`` — ``RESSHIFT_MODEL`` + ``IMAGE`` -> ``IMAGE`` (×4), one step.
+* ``ResShiftUpscale`` — ``RESSHIFT_MODEL`` + ``IMAGE`` -> ``IMAGE`` (×scale), one step.
 
-The student (~478 MB ema-only safetensors) auto-downloads from the public
-``sorryhyun/Distilled-ResShift-4x`` HF repo; the vq-f4 VQGAN (~211 MB) auto-downloads
-from the upstream ResShift v1.0 GitHub release. Both land in ``ComfyUI/models/resshift/``.
+The student (~478 MB ema-only safetensors) auto-downloads per scale from the public
+``sorryhyun/Distilled-ResShift-4x`` (×4) or ``-2x`` (×2) HF repo; the vq-f4 VQGAN
+(~211 MB) auto-downloads from the upstream ResShift v1.0 GitHub release. Both land in
+``ComfyUI/models/resshift/``.
 
 The ResShift network is vendored self-contained under ``_vendor/resshift/`` (S-Lab
 license, from zsyOAOA/ResShift), already carrying the query-chunked-SDPA patch that

@@ -1,0 +1,69 @@
+# Inference-only slice for the 1-step RSD ×2 student. Identical to
+# realsr_swinunet_inference.yaml (the ×4 slice) EXCEPT diffusion.params.sf: 4 -> 2.
+# The UNet arch, residual-shift schedule (steps=15, min_noise_level=0.04, kappa=2.0),
+# predict_type=xstart and vq-f4 autoencoder are all unchanged — the ×2 lives only in
+# the scale factor (which drives the bicubic pre-upsample and the Swin alignment).
+# autoencoder.ckpt_path is overwritten at load time with the resolved local path.
+
+model:
+  target: resshift.models.unet.UNetModelSwin
+  ckpt_path: ~
+  params:
+    image_size: 64
+    in_channels: 3
+    model_channels: 160
+    out_channels: 3
+    attention_resolutions: [64, 32, 16, 8]
+    dropout: 0
+    channel_mult: [1, 2, 2, 4]
+    num_res_blocks: [2, 2, 2, 2]
+    conv_resample: True
+    dims: 2
+    use_fp16: False
+    num_head_channels: 32
+    use_scale_shift_norm: True
+    resblock_updown: False
+    swin_depth: 2
+    swin_embed_dim: 192
+    window_size: 8
+    mlp_ratio: 4
+    cond_lq: True
+    lq_size: 64
+
+diffusion:
+  target: resshift.models.script_util.create_gaussian_diffusion
+  params:
+    sf: 2
+    schedule_name: exponential
+    schedule_kwargs:
+      power: 0.3
+    etas_end: 0.99
+    steps: 15
+    min_noise_level: 0.04
+    kappa: 2.0
+    weighted_mse: False
+    predict_type: xstart
+    timestep_respacing: ~
+    scale_factor: 1.0
+    normalize_input: True
+    latent_flag: True
+
+autoencoder:
+  target: resshift.ldm.models.autoencoder.VQModelTorch
+  ckpt_path: weights/autoencoder_vq_f4.pth
+  use_fp16: True
+  params:
+    embed_dim: 3
+    n_embed: 8192
+    ddconfig:
+      double_z: False
+      z_channels: 3
+      resolution: 256
+      in_channels: 3
+      out_ch: 3
+      ch: 128
+      ch_mult: [1, 2, 4]
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+      padding_mode: zeros

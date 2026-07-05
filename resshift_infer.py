@@ -37,6 +37,13 @@ from resshift.utils import util_common  # noqa: E402  (vendored ResShift)
 from resshift.models.unet import UNetModelSwin  # noqa: E402  (vendored ResShift)
 
 DEFAULT_CONFIG = VENDOR / "configs" / "realsr_swinunet_inference.yaml"
+X2_CONFIG = VENDOR / "configs" / "realsr_swinunet_x2_inference.yaml"
+
+# Inference config per scale tag. x4/x2 differ ONLY in diffusion.params.sf (4 vs 2),
+# which drives the bicubic pre-upsample factor and the Swin alignment (swin_align); the
+# UNet arch + vq-f4 VQGAN + residual-shift schedule are identical, so one student arch
+# and one VQGAN serve both.
+CONFIGS = {"x4": DEFAULT_CONFIG, "x2": X2_CONFIG}
 
 
 # --------------------------------------------------------------------------- config

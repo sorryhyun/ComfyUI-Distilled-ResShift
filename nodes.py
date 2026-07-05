@@ -1,21 +1,23 @@
-"""ComfyUI nodes: distilled 1-step ResShift ×4 super-resolution (IMAGE → IMAGE).
+"""ComfyUI nodes: distilled 1-step ResShift super-resolution (IMAGE → IMAGE), ×4 or ×2.
 
 Two nodes:
   * ResShiftLoader   — load the RSD student + vq-f4 VQGAN -> RESSHIFT_MODEL socket
-  * ResShiftUpscale  — RESSHIFT_MODEL + IMAGE -> IMAGE, 4x super-resolved in ONE step
+  * ResShiftUpscale  — RESSHIFT_MODEL + IMAGE -> IMAGE, super-resolved in ONE step
 
 Unlike a latent/VAE-decode node, this is a pixel-space upscaler: it takes any RGB
-image, bicubic-upsamples ×4, runs one stochastic ResShift student step in vq-f4 latent
-space, and decodes 4× the input edge. Drop it after VAEDecode / SaveImage — it is
-model-agnostic (works on any image, not just Anima output):
+image, bicubic-upsamples ×scale, runs one stochastic ResShift student step in vq-f4
+latent space, and decodes scale× the input edge. The Loader's `scale` dropdown picks
+×4 or ×2 (same arch + VQGAN — only the diffusion sf differs). Drop it after VAEDecode /
+SaveImage — it is model-agnostic (works on any image, not just Anima output):
 
     ... -> VAEDecode -> IMAGE ─┐
-                               ├─► ResShiftUpscale ─► IMAGE (4x) -> SaveImage
+                               ├─► ResShiftUpscale ─► IMAGE (×scale) -> SaveImage
     ResShiftLoader ───────┘
 
 The student (~478 MB, ema-only safetensors) auto-downloads from the public
-sorryhyun/Distilled-ResShift-4x HF repo; the vq-f4 VQGAN (~211 MB) auto-downloads from
-the upstream ResShift v1.0 GitHub release. Both land in ComfyUI/models/resshift/.
+sorryhyun/Distilled-ResShift-4x (×4) or -2x (×2) HF repo per the selected scale; the
+vq-f4 VQGAN (~211 MB) auto-downloads from the upstream ResShift v1.0 GitHub release.
+Both land in ComfyUI/models/resshift/.
 """
 import os
 import shutil
@@ -38,27 +40,36 @@ folder_paths.add_model_folder_path("resshift", _RSD_DIR)
 _DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32}
 _CKPT_EXTS = (".safetensors", ".pth", ".pt", ".ckpt", ".bin")
 
-# The distilled student (ema-only safetensors, ~478 MB) on the public HF repo.
-_HF_STUDENT_REPO = "sorryhyun/Distilled-ResShift-4x"
-_HF_STUDENT_FILE = "rsd_student_12k.safetensors"
+# The distilled students (ema-only safetensors, ~478 MB each) on the public HF repos,
+# one per scale. Both share the vq-f4 VQGAN and the StochasticUNet arch — the only
+# difference is the diffusion sf (see resshift_infer.CONFIGS).
+_STUDENTS = {
+    "x4": {"repo": "sorryhyun/Distilled-ResShift-4x", "file": "rsd_student_12k.safetensors"},
+    "x2": {"repo": "sorryhyun/Distilled-ResShift-2x", "file": "rsd_student_2k.safetensors"},
+}
+_STUDENT_FILES = {spec["file"] for spec in _STUDENTS.values()}
+_SCALES = list(_STUDENTS)  # dropdown order: ["x4", "x2"]
+
 # The vq-f4 autoencoder is a ResShift v1.0 GitHub release asset (NOT on HF Hub).
 _VQGAN_URL = "https://github.com/zsyOAOA/ResShift/releases/download/v2.0/autoencoder_vq_f4.pth"
 _VQGAN_FILE = "autoencoder_vq_f4.pth"
 
 # Stable dropdown sentinel for the student auto-download — ALWAYS present so a saved
-# workflow that selected it stays valid across restarts.
+# workflow that selected it stays valid across restarts. The `scale` input picks WHICH
+# student the sentinel fetches (x4 or x2).
 _AUTODL_ENTRY = "(auto-download)"
 
 
-def _download_student() -> str:
-    """Fetch the ema-only student safetensors into models/resshift/ (one-time)."""
-    dest = os.path.join(_RSD_DIR, _HF_STUDENT_FILE)
+def _download_student(scale) -> str:
+    """Fetch the ema-only student safetensors for `scale` into models/resshift/ (one-time)."""
+    spec = _STUDENTS[scale]
+    dest = os.path.join(_RSD_DIR, spec["file"])
     if os.path.exists(dest):
         return dest
     from huggingface_hub import hf_hub_download
 
-    print(f"[ResShift] fetching {_HF_STUDENT_REPO}/{_HF_STUDENT_FILE} -> {dest} (one-time, ~478 MB).")
-    downloaded = hf_hub_download(repo_id=_HF_STUDENT_REPO, filename=_HF_STUDENT_FILE)
+    print(f"[ResShift] fetching {spec['repo']}/{spec['file']} -> {dest} (one-time, ~478 MB).")
+    downloaded = hf_hub_download(repo_id=spec["repo"], filename=spec["file"])
     shutil.copyfile(downloaded, dest)
     return dest
 
@@ -137,6 +148,11 @@ class ResShiftLoader:
         files.insert(0, _AUTODL_ENTRY)
         return {
             "required": {
+                "scale": (_SCALES, {"default": "x4",
+                          "tooltip": "Super-resolution factor. x4 (default) = the released ×4 student; "
+                                     "x2 = the ×2 student (finer input, gentler jump). Picks both the "
+                                     "auto-download repo AND the diffusion schedule (sf), so a locally "
+                                     "selected student must match the scale it was distilled at."}),
                 "student_name": (files,),
                 "dtype": (["bf16", "fp32"], {"default": "bf16",
                           "tooltip": "bf16 (default) matches training/eval: ~2x faster, ~half VRAM. "
@@ -149,11 +165,15 @@ class ResShiftLoader:
     FUNCTION = "load"
     CATEGORY = "ResShift"
 
-    def load(self, student_name, dtype):
-        if student_name == _AUTODL_ENTRY or "(auto-download)" in student_name or student_name == _HF_STUDENT_FILE:
-            student_path = _download_student()
+    def load(self, scale, student_name, dtype):
+        if student_name == _AUTODL_ENTRY or "(auto-download)" in student_name:
+            student_path = _download_student(scale)
         else:
             student_path = folder_paths.get_full_path("resshift", student_name)
+            # A saved workflow may store a known student's filename that isn't local yet
+            # (e.g. after a cache wipe) — fetch the scale's student to keep it valid.
+            if (student_path is None or not os.path.exists(student_path)) and student_name in _STUDENT_FILES:
+                student_path = _download_student(scale)
         if student_path is None or not os.path.exists(student_path):
             raise FileNotFoundError(
                 f"student checkpoint {student_name!r} not found under {_RSD_DIR}. "
@@ -166,7 +186,7 @@ class ResShiftLoader:
         offload = mm.unet_offload_device()
         load_device = mm.get_torch_device()
 
-        cfg = R.load_configs(vqgan_path)
+        cfg = R.load_configs(vqgan_path, config_path=R.CONFIGS[scale])
         diff = R.build_diffusion(cfg)
         scale = int(cfg.diffusion.params.sf)
         align = R.swin_align(cfg)
@@ -199,8 +219,8 @@ class ResShiftUpscale:
                                             "injected ε). Same seed + input = reproducible output."}),
                 "chop": ("INT", {"default": 512, "min": 256, "max": 4096, "step": 256,
                                  "tooltip": "Tile size in px for large images (snapped to a multiple of the "
-                                            "Swin align stride, 256). Lower it if VRAM-bound; a whole image "
-                                            "≤ chop runs single-tile."}),
+                                            "Swin align stride — 256 at ×4, 128 at ×2). Lower it if VRAM-bound; "
+                                            "a whole image ≤ chop runs single-tile."}),
                 "overlap": ("INT", {"default": 64, "min": 0, "max": 512, "step": 16,
                                     "tooltip": "Tile seam overlap in px. Tile stride = chop - overlap (must be "
                                                ">0). Larger = fewer seams, more redundant compute."}),
@@ -253,6 +273,6 @@ NODE_CLASS_MAPPINGS = {
     "ResShiftUpscale": ResShiftUpscale,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ResShiftLoader": "ResShift SR Loader (distilled ×4)",
-    "ResShiftUpscale": "ResShift SR Upscale (1-step ×4)",
+    "ResShiftLoader": "ResShift SR Loader (distilled ×4/×2)",
+    "ResShiftUpscale": "ResShift SR Upscale (1-step)",
 }
