@@ -2,7 +2,7 @@
 
 A **1-step ResShift** super-resolution student as a pixel-space **`IMAGE → IMAGE`**
 upscaler for ComfyUI, at **×4 or ×2** (a `scale` dropdown on the loader). The student is
-distilled (paper [2603.22490](https://arxiv.org/abs/2503.13358), *One-Step Residual
+distilled (paper [2603.22490](https://arxiv.org/abs/2503.13358), [repo](https://github.com/Daniil-Selikhanovych/RSD), *One-Step Residual
 Shifting Diffusion via Distillation*) from a 15-step ResShift teacher, so it does the
 whole super-resolution jump in a **single stochastic network step** — no multi-step
 sampler, no CFG.
