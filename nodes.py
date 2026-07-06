@@ -228,14 +228,22 @@ class ResShiftUpscale:
                                        "tooltip": "Tiles stacked into one forward — small tiles underfill the "
                                                   "GPU one-at-a-time, so batching amortizes launch overhead. "
                                                   "VRAM scales ~linearly; tune to the card."}),
-            }
+            },
+            "optional": {
+                "shared_noise": ("BOOLEAN", {"default": True,
+                                             "tooltip": "Draw one full-image noise field and share it across "
+                                                        "overlapping tiles so the seam-average is discontinuity-"
+                                                        "free (removes faint tile-block seams in flat regions). "
+                                                        "A few MB, quality-neutral; only matters when tiled "
+                                                        "(image > chop). Off = independent per-tile noise (old)."}),
+            },
         }
 
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "upscale"
     CATEGORY = "ResShift"
 
-    def upscale(self, rsd_model, image, seed, chop, overlap, tile_batch):
+    def upscale(self, rsd_model, image, seed, chop, overlap, tile_batch, shared_noise=True):
         align = rsd_model.align
         # Swin needs each tile's dims % align == 0; snap chop up, clamp overlap so stride > 0.
         chop = max(align, (chop // align) * align)
@@ -261,7 +269,8 @@ class ResShiftUpscale:
         for b in range(B):
             sr = R.upscale(cfg, diff, vqgan, student, x[b:b + 1], device, scale, align,
                            overlap=overlap, chop=chop, tile_batch=tile_batch, amp=amp,
-                           seed=(int(seed) + b), progress=lambda: pbar.update(1))
+                           seed=(int(seed) + b), progress=lambda: pbar.update(1),
+                           shared_noise=shared_noise)
             outs.append(sr)
         out = torch.cat(outs, dim=0)  # (B,3,H*s,W*s) in [-1,1]
         img = (out.clamp(-1, 1) * 0.5 + 0.5).permute(0, 2, 3, 1).contiguous().float().cpu()

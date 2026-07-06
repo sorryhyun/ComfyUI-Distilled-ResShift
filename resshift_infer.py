@@ -268,11 +268,16 @@ def count_tiles(H, W, chop, overlap):
 # ------------------------------------------------------------------------- upscale
 
 @torch.no_grad()
-def _sample_tile(cfg, diff, vqgan, student, hr_t, align, device, amp, generator):
+def _sample_tile(cfg, diff, vqgan, student, hr_t, align, device, amp, generator,
+                 zT_noise=None, eps_noise=None):
     """One tile: reflect-pad to `align`, encode → 1-step student → decode → crop back.
     In/out (1,3,H,W) in [-1,1]. Heavy matmuls under bf16 autocast when `amp`; the VQGAN
     runs in its native (bf16 or fp32) dtype OUTSIDE autocast so GroupNorm activations
-    stay in that dtype (autocast would force the full-res norms to fp32 = the VRAM peak)."""
+    stay in that dtype (autocast would force the full-res norms to fp32 = the VRAM peak).
+
+    `zT_noise`/`eps_noise` (latent-shaped, matching z_y): a precomputed noise slice from
+    the shared full-image field (see `upscale`), so overlapping tiles draw IDENTICAL noise
+    and the overlap-average is seam-free. None = the original independent per-tile draw."""
     import torch.nn.functional as F
     h, w = hr_t.shape[2:]
     ph, pw = (-h) % align, (-w) % align
@@ -281,20 +286,31 @@ def _sample_tile(cfg, diff, vqgan, student, hr_t, align, device, amp, generator)
     ctx = torch.autocast("cuda", dtype=torch.bfloat16) if amp else nullcontext()
     vdt = next(vqgan.parameters()).dtype
     z_y = vqgan.encode(hr_t.to(vdt)) * cfg.diffusion.params.scale_factor
-    z_T = z_y + diff.kappa * torch.randn(z_y.shape, device=device, dtype=z_y.dtype, generator=generator)
+    zt_n = (torch.randn(z_y.shape, device=device, dtype=z_y.dtype, generator=generator)
+            if zT_noise is None else zT_noise.to(z_y.dtype))
+    z_T = z_y + diff.kappa * zt_n
+    eps = make_eps(student, z_y, generator) if eps_noise is None else eps_noise.to(z_y.dtype)
     tT = torch.full((z_y.shape[0],), diff.num_timesteps - 1, device=device, dtype=torch.long)
     with ctx:
-        z0 = predict_x0(diff, student, z_T, z_y, tT, make_eps(student, z_y, generator))
+        z0 = predict_x0(diff, student, z_T, z_y, tT, eps)
     img = vqgan.decode(z0.to(vdt), force_not_quantize=True).clamp(-1, 1)
     return img[:, :, :h, :w].float()
 
 
 @torch.no_grad()
 def upscale(cfg, diff, vqgan, student, lr_m1p1, device, scale, align,
-            overlap, chop, tile_batch, amp=True, seed=None, progress=None):
+            overlap, chop, tile_batch, amp=True, seed=None, progress=None, shared_noise=True):
     """1-step student ×`scale` SR. `lr_m1p1` is (1,3,H,W) in [-1,1] at LR resolution;
     it is bicubic-upsampled ×scale first (the student is spatially same-resolution),
-    then tiled with ImageSpliterTh(sf=1). Returns (1,3,H*scale,W*scale) in [-1,1]."""
+    then tiled with ImageSpliterTh(sf=1). Returns (1,3,H*scale,W*scale) in [-1,1].
+
+    `shared_noise` (default on): the student injects two independent noise draws per
+    forward (3-ch residual-shift `z_T` + 1-ch `make_eps`). Drawn per tile, neighbouring
+    tiles get DIFFERENT noise and the overlap-average leaves a faint tile-block seam in
+    flat regions. Instead we draw ONE full-image latent noise field per source and slice
+    each tile's noise from it by latent position, so overlapping tiles read IDENTICAL
+    noise → seam-free. A few MB (latent-res), quality-neutral, marginally cheaper than
+    per-tile. Only the tiled path uses it (a single un-tiled tile has no seam)."""
     import torch.nn.functional as F
     gen = None
     if seed is not None:
@@ -303,8 +319,25 @@ def upscale(cfg, diff, vqgan, student, lr_m1p1, device, scale, align,
     H, W = up.shape[2:]
     if H > chop or W > chop:
         spliter = ImageSpliterTh(up, chop, stride=chop - overlap, sf=1, extra_bs=tile_batch)
+        g_zT = g_eps = None
+        if shared_noise:
+            ch_mult = cfg.autoencoder.params.ddconfig.ch_mult
+            f = 2 ** (len(ch_mult) - 1)               # VQ-f4 -> 4
+            z_ch = cfg.autoencoder.params.ddconfig.z_channels
+            gpad = chop // f                          # margin so any tile start slices in-bounds
+            hl, wl = H // f + gpad, W // f + gpad
+            g_zT = torch.randn(1, z_ch, hl, wl, device=device, generator=gen)
+            g_eps = torch.randn(1, student.noise_channels, hl, wl, device=device, generator=gen)
+            lt = chop // f                            # per-tile latent size
         for pch, info in spliter:
-            spliter.update(_sample_tile(cfg, diff, vqgan, student, pch, align, device, amp, gen), info)
+            zt_noise = eps_noise = None
+            if shared_noise:
+                zt_noise = torch.cat([g_zT[:, :, h0 // f:h0 // f + lt, w0 // f:w0 // f + lt]
+                                      for (h0, _, w0, _) in info], dim=0)
+                eps_noise = torch.cat([g_eps[:, :, h0 // f:h0 // f + lt, w0 // f:w0 // f + lt]
+                                       for (h0, _, w0, _) in info], dim=0)
+            spliter.update(_sample_tile(cfg, diff, vqgan, student, pch, align, device, amp, gen,
+                                        zT_noise=zt_noise, eps_noise=eps_noise), info)
             if progress is not None:
                 progress()
         img = spliter.gather()
