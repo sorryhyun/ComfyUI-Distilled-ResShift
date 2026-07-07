@@ -45,7 +45,7 @@ _CKPT_EXTS = (".safetensors", ".pth", ".pt", ".ckpt", ".bin")
 # difference is the diffusion sf (see resshift_infer.CONFIGS).
 _STUDENTS = {
     "x4": {"repo": "sorryhyun/Distilled-ResShift-4x", "file": "rsd_student_12k.safetensors"},
-    "x2": {"repo": "sorryhyun/Distilled-ResShift-2x", "file": "rsd_student_2k.safetensors"},
+    "x2": {"repo": "sorryhyun/Distilled-ResShift-2x", "file": "rsd_student_40k.safetensors"},
 }
 _STUDENT_FILES = {spec["file"] for spec in _STUDENTS.values()}
 _SCALES = list(_STUDENTS)  # dropdown order: ["x4", "x2"]
