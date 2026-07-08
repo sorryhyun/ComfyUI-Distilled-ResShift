@@ -56,11 +56,15 @@ def load_configs(vqgan_ckpt, config_path=DEFAULT_CONFIG):
 
 
 def swin_align(cfg):
-    """Pixel alignment the SwinUNet needs. The deepest level runs at latent / 2^(L-1)
-    with a fixed window, so each tile's latent must be divisible by window·2^(L-1);
-    ×sf for the pixel grid. A non-aligned tile crashes window_partition at the deep level."""
+    """Pixel alignment the SwinUNet needs. Tiles are cut at MODEL-INPUT (post-upsample)
+    resolution, so latent = pixels / f_vq and the deepest level runs at latent / 2^(L-1)
+    with a hard window_partition view (no internal pad): each tile dim must be divisible
+    by f_vq·window·2^(L-1) = 256, INDEPENDENT of sf. (The old ×sf formula was correct at
+    ×4 only because sf == f_vq == 4; at ×2 it under-aligned to 128, so an edge tile
+    reflect-padded to a 128-but-not-256 multiple crashed the deepest window_partition.)"""
     n_levels = len(cfg.model.params.get("channel_mult", [1, 2, 2, 4]))
-    return int(cfg.diffusion.params.sf) * int(cfg.model.params.window_size) * (2 ** (n_levels - 1))
+    f_vq = 2 ** (len(cfg.autoencoder.params.ddconfig.ch_mult) - 1)
+    return f_vq * int(cfg.model.params.window_size) * (2 ** (n_levels - 1))
 
 
 # --------------------------------------------------------------- stochastic student
@@ -187,7 +191,15 @@ class ImageSpliterTh:
     """Overlap-tiling helper (ResShift utils.util_image, inlined — pure torch, no cv2).
 
     Splits an (B,C,H,W) tensor into pch_size tiles on a `stride` grid, gathers the
-    per-tile results with overlap averaging. sf=1 here (the student is same-resolution).
+    per-tile results with overlap blending. sf=1 here (the student is same-resolution).
+
+    Blending is FEATHERED, not the upstream box average: each tile's weight ramps 0→1
+    over the overlap width from its own edge (Hann profile, separable). The box average
+    steps the blend weight at the overlap edges (1 tile ↔ 2 tiles), so any per-tile
+    disagreement (each tile's VQGAN encode + Swin sees different context — present even
+    with the shared noise field) lands as a visible line exactly there; feathering fades
+    it in smoothly instead. gather() renormalizes by accumulated weight, so borders
+    (single tile at partial weight) come out exact; overlap == 0 keeps hard box tiles.
     """
 
     def __init__(self, im, pch_size, stride, sf=1, extra_bs=1):
@@ -203,6 +215,21 @@ class ImageSpliterTh:
         self.im_ori = im
         self.im_res = torch.zeros([bs, chn, height * sf, width * sf], dtype=im.dtype, device=im.device)
         self.pixel_count = torch.zeros_like(self.im_res)
+        self.ramp = (pch_size - stride) * sf   # overlap width at output res = feather span
+        self._wcache = {}
+
+    def _tile_weight(self, h, w, dtype, device):
+        if self.ramp <= 0:
+            return None
+        key = (h, w, dtype, device)
+        if key not in self._wcache:
+            def prof(length):
+                d = torch.arange(length, device=device, dtype=torch.float32) + 0.5
+                d = torch.minimum(d, length - d).clamp(max=self.ramp) / self.ramp
+                return 0.5 - 0.5 * torch.cos(torch.pi * d)
+            w2d = (prof(h)[:, None] * prof(w)[None, :]).clamp(min=1e-3)
+            self._wcache[key] = w2d.to(dtype)[None, None]
+        return self._wcache[key]
 
     def _starts(self, length):
         if length <= self.pch_size:
@@ -236,9 +263,15 @@ class ImageSpliterTh:
     def update(self, pch_res, index_infos):
         pch_list = torch.split(pch_res, self.true_bs, dim=0)
         assert len(pch_list) == len(index_infos)
+        wt = self._tile_weight(pch_res.shape[-2], pch_res.shape[-1],
+                               pch_res.dtype, pch_res.device)
         for cur, (h0, h1, w0, w1) in zip(pch_list, index_infos):
-            self.im_res[:, :, h0:h1, w0:w1] += cur
-            self.pixel_count[:, :, h0:h1, w0:w1] += 1
+            if wt is None:
+                self.im_res[:, :, h0:h1, w0:w1] += cur
+                self.pixel_count[:, :, h0:h1, w0:w1] += 1
+            else:
+                self.im_res[:, :, h0:h1, w0:w1] += cur * wt
+                self.pixel_count[:, :, h0:h1, w0:w1] += wt
 
     def gather(self):
         assert torch.all(self.pixel_count != 0)
@@ -286,10 +319,14 @@ def _sample_tile(cfg, diff, vqgan, student, hr_t, align, device, amp, generator,
     ctx = torch.autocast("cuda", dtype=torch.bfloat16) if amp else nullcontext()
     vdt = next(vqgan.parameters()).dtype
     z_y = vqgan.encode(hr_t.to(vdt)) * cfg.diffusion.params.scale_factor
+    # Noise slices are chop//f-sized; a skinny tile (image dim ≤ chop on one axis) pads to
+    # LESS than chop, so crop the slice to the actual latent dims before injecting.
+    hz, wz = z_y.shape[2:]
     zt_n = (torch.randn(z_y.shape, device=device, dtype=z_y.dtype, generator=generator)
-            if zT_noise is None else zT_noise.to(z_y.dtype))
+            if zT_noise is None else zT_noise[:, :, :hz, :wz].to(z_y.dtype))
     z_T = z_y + diff.kappa * zt_n
-    eps = make_eps(student, z_y, generator) if eps_noise is None else eps_noise.to(z_y.dtype)
+    eps = (make_eps(student, z_y, generator) if eps_noise is None
+           else eps_noise[:, :, :hz, :wz].to(z_y.dtype))
     tT = torch.full((z_y.shape[0],), diff.num_timesteps - 1, device=device, dtype=torch.long)
     with ctx:
         z0 = predict_x0(diff, student, z_T, z_y, tT, eps)

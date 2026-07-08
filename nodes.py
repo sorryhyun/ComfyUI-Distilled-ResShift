@@ -45,7 +45,7 @@ _CKPT_EXTS = (".safetensors", ".pth", ".pt", ".ckpt", ".bin")
 # difference is the diffusion sf (see resshift_infer.CONFIGS).
 _STUDENTS = {
     "x4": {"repo": "sorryhyun/Distilled-ResShift-4x", "file": "rsd_student_12k.safetensors"},
-    "x2": {"repo": "sorryhyun/Distilled-ResShift-2x", "file": "rsd_student_2k.safetensors"},
+    "x2": {"repo": "sorryhyun/Distilled-ResShift-2x", "file": "rsd_student_18k.safetensors"},
 }
 _STUDENT_FILES = {spec["file"] for spec in _STUDENTS.values()}
 _SCALES = list(_STUDENTS)  # dropdown order: ["x4", "x2"]
@@ -219,11 +219,14 @@ class ResShiftUpscale:
                                             "injected ε). Same seed + input = reproducible output."}),
                 "chop": ("INT", {"default": 512, "min": 256, "max": 4096, "step": 256,
                                  "tooltip": "Tile size in px for large images (snapped to a multiple of the "
-                                            "Swin align stride — 256 at ×4, 128 at ×2). Lower it if VRAM-bound; "
-                                            "a whole image ≤ chop runs single-tile."}),
+                                            "Swin align stride, 256). Lower it if VRAM-bound; a whole image "
+                                            "≤ chop runs single-tile. Bigger tiles = more context per tile = "
+                                            "weaker seams."}),
                 "overlap": ("INT", {"default": 64, "min": 0, "max": 512, "step": 16,
                                     "tooltip": "Tile seam overlap in px. Tile stride = chop - overlap (must be "
-                                               ">0). Larger = fewer seams, more redundant compute."}),
+                                               ">0). Also the feather ramp width (tile weights blend with a "
+                                               "raised-cosine across the overlap); 0 = hard-abutted box tiles. "
+                                               "Larger = fewer seams, more redundant compute."}),
                 "tile_batch": ("INT", {"default": 4, "min": 1, "max": 32,
                                        "tooltip": "Tiles stacked into one forward — small tiles underfill the "
                                                   "GPU one-at-a-time, so batching amortizes launch overhead. "
@@ -245,9 +248,11 @@ class ResShiftUpscale:
 
     def upscale(self, rsd_model, image, seed, chop, overlap, tile_batch, shared_noise=True):
         align = rsd_model.align
-        # Swin needs each tile's dims % align == 0; snap chop up, clamp overlap so stride > 0.
+        # Swin needs each tile's dims % align == 0; snap chop, clamp overlap so stride > 0
+        # (stride needs no alignment of its own — every tile is a full chop square; 16 keeps
+        # it on the UI step so tile starts stay latent-exact for the shared noise slicing).
         chop = max(align, (chop // align) * align)
-        overlap = max(0, min(overlap, chop - align))
+        overlap = max(0, min(overlap, chop - 16))
 
         mm.load_models_gpu([rsd_model.patcher])
         device = rsd_model.patcher.load_device
