@@ -22,7 +22,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from omegaconf import OmegaConf
+import yaml
 
 HERE = Path(__file__).resolve().parent
 VENDOR = HERE / "_vendor" / "resshift"
@@ -48,9 +48,45 @@ CONFIGS = {"x4": DEFAULT_CONFIG, "x2": X2_CONFIG}
 
 # --------------------------------------------------------------------------- config
 
+class _Cfg(dict):
+    """Attribute-access dict — the only OmegaConf feature the static inference YAMLs use.
+
+    The configs carry no `${}` interpolations and no resolvers, so PyYAML (already a
+    ComfyUI core dep) + this wrapper replaces omegaconf outright, keeping the node
+    dependency-free.
+    """
+
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(key) from None
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+
+def _wrap(obj):
+    if isinstance(obj, dict):
+        return _Cfg({k: _wrap(v) for k, v in obj.items()})
+    if isinstance(obj, list):
+        return [_wrap(v) for v in obj]
+    return obj
+
+
+def _plain(obj):
+    """_Cfg tree -> plain dict/list (the OmegaConf.to_container equivalent)."""
+    if isinstance(obj, dict):
+        return {k: _plain(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_plain(v) for v in obj]
+    return obj
+
+
 def load_configs(vqgan_ckpt, config_path=DEFAULT_CONFIG):
     """Load the inference config; point the autoencoder at the resolved VQGAN ckpt."""
-    cfg = OmegaConf.load(str(config_path))
+    with open(config_path, "r", encoding="utf-8") as fh:
+        cfg = _wrap(yaml.safe_load(fh))
     cfg.autoencoder.ckpt_path = str(vqgan_ckpt)
     return cfg
 
@@ -150,7 +186,7 @@ def predict_x0(diff, model, z_t, z_y, t, eps=None):
 # ---------------------------------------------------------------------- builders
 
 def _unet_params(cfg):
-    return OmegaConf.to_container(cfg.model.params, resolve=True)
+    return _plain(cfg.model.params)
 
 
 def build_student(cfg, device, dtype=torch.float32, noise_mode="concat", noise_channels=None):
@@ -161,7 +197,7 @@ def build_student(cfg, device, dtype=torch.float32, noise_mode="concat", noise_c
 
 def build_autoencoder(cfg, device, dtype=torch.float32):
     ae = util_common.get_obj_from_str(cfg.autoencoder.target)(
-        **OmegaConf.to_container(cfg.autoencoder.params, resolve=True)
+        **_plain(cfg.autoencoder.params)
     )
     sd = torch.load(cfg.autoencoder.ckpt_path, map_location="cpu")
     sd = sd["state_dict"] if isinstance(sd, dict) and "state_dict" in sd else sd
@@ -175,7 +211,7 @@ def build_autoencoder(cfg, device, dtype=torch.float32):
 def build_diffusion(cfg):
     """ResShift residual-shift GaussianDiffusion (used for _scale_input + num_timesteps)."""
     return util_common.get_obj_from_str(cfg.diffusion.target)(
-        **OmegaConf.to_container(cfg.diffusion.params, resolve=True)
+        **_plain(cfg.diffusion.params)
     )
 
 
