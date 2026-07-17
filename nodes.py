@@ -44,7 +44,7 @@ _CKPT_EXTS = (".safetensors", ".pth", ".pt", ".ckpt", ".bin")
 # one per scale. Both share the vq-f4 VQGAN and the StochasticUNet arch — the only
 # difference is the diffusion sf (see resshift_infer.CONFIGS).
 _STUDENTS = {
-    "x4": {"repo": "sorryhyun/Distilled-ResShift-4x", "file": "rsd_student_12k.safetensors"},
+    "x4": {"repo": "sorryhyun/Distilled-ResShift-4x", "file": "rsd_student_final.safetensors"},
     "x2": {"repo": "sorryhyun/Distilled-ResShift-2x", "file": "rsd_student_18k.safetensors"},
 }
 _STUDENT_FILES = {spec["file"] for spec in _STUDENTS.values()}
@@ -91,10 +91,15 @@ def _ensure_vqgan() -> str:
 
 
 def _read_student(path):
-    """Return (state_dict, noise_mode, noise_channels) from a student .safetensors or .pth.
+    """Return (state_dict, noise_mode, noise_channels, cond_lq) from a student
+    .safetensors or .pth.
 
     safetensors carries the arch metadata in its string header; a raw training .pth
-    carries it as top-level keys alongside the 'ema' branch."""
+    carries it as top-level keys alongside the 'ema' branch.
+
+    `cond_lq` defaults to "latent": students distilled before 2026-07-11 carry no such
+    key and were trained under the latent convention (the released x4 12k student and
+    the whole x2 line). Pixel-conditioned students state it explicitly."""
     if path.endswith(".safetensors"):
         from safetensors import safe_open
         from safetensors.torch import load_file
@@ -103,11 +108,13 @@ def _read_student(path):
         sd = load_file(path)
         noise_mode = meta.get("noise_mode", "concat")
         nc = meta.get("noise_channels")
-        return sd, noise_mode, (int(nc) if nc is not None else None)
+        return (sd, noise_mode, (int(nc) if nc is not None else None),
+                meta.get("cond_lq", "latent"))
     blob = torch.load(path, map_location="cpu")
     if isinstance(blob, dict) and "ema" in blob:
-        return blob["ema"], blob.get("noise_mode", "concat"), blob.get("noise_channels")
-    return blob, "concat", None
+        return (blob["ema"], blob.get("noise_mode", "concat"), blob.get("noise_channels"),
+                blob.get("cond_lq", "latent"))
+    return blob, "concat", None, "latent"
 
 
 class _RSDBundle(nn.Module):
@@ -123,13 +130,14 @@ class _RSDBundle(nn.Module):
 class ResShiftModel:
     """RESSHIFT_MODEL socket: ModelPatcher-wrapped student+VQGAN bundle + inference config."""
 
-    def __init__(self, patcher, cfg, diff, scale, align, amp):
+    def __init__(self, patcher, cfg, diff, scale, align, amp, cond_lq="latent"):
         self.patcher = patcher
         self.cfg = cfg
         self.diff = diff
         self.scale = scale
         self.align = align
         self.amp = amp
+        self.cond_lq = cond_lq
 
     @property
     def student(self):
@@ -191,7 +199,7 @@ class ResShiftLoader:
         scale = int(cfg.diffusion.params.sf)
         align = R.swin_align(cfg)
 
-        sd, noise_mode, noise_channels = _read_student(student_path)
+        sd, noise_mode, noise_channels, cond_lq = _read_student(student_path)
         # Student weights stay fp32 and run under bf16 autocast (matches infer.py); the
         # VQGAN goes native-bf16 so its full-res GroupNorm activations (the VRAM peak)
         # aren't forced back to fp32 by autocast. In fp32 mode both stay fp32.
@@ -202,9 +210,10 @@ class ResShiftLoader:
         bundle = _RSDBundle(student, vqgan)
 
         patcher = comfy.model_patcher.ModelPatcher(bundle, load_device=load_device, offload_device=offload)
-        print(f"[ResShift] loaded student ({noise_mode}/{student.noise_channels}ch) + vq-f4 "
+        print(f"[ResShift] loaded student ({noise_mode}/{student.noise_channels}ch, "
+              f"lq={cond_lq}) + vq-f4 "
               f"VQGAN as {dtype} (×{scale}, align={align}; ComfyUI-managed)")
-        return (ResShiftModel(patcher, cfg, diff, scale, align, amp),)
+        return (ResShiftModel(patcher, cfg, diff, scale, align, amp, cond_lq),)
 
 
 class ResShiftUpscale:
@@ -275,7 +284,7 @@ class ResShiftUpscale:
             sr = R.upscale(cfg, diff, vqgan, student, x[b:b + 1], device, scale, align,
                            overlap=overlap, chop=chop, tile_batch=tile_batch, amp=amp,
                            seed=(int(seed) + b), progress=lambda: pbar.update(1),
-                           shared_noise=shared_noise)
+                           shared_noise=shared_noise, cond_mode=rsd_model.cond_lq)
             outs.append(sr)
         out = torch.cat(outs, dim=0)  # (B,3,H*s,W*s) in [-1,1]
         img = (out.clamp(-1, 1) * 0.5 + 0.5).permute(0, 2, 3, 1).contiguous().float().cpu()

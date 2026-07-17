@@ -178,9 +178,44 @@ def make_eps(model, ref, generator=None):
                        device=ref.device, dtype=ref.dtype, generator=generator)
 
 
-def predict_x0(diff, model, z_t, z_y, t, eps=None):
-    """ResShift x0 prediction (predict_type=xstart): scale input, forward, output IS x0."""
-    return model(diff._scale_input(z_t, t), t, lq=z_y, eps=eps)
+def predict_x0(diff, model, z_t, c_y, t, eps=None):
+    """ResShift x0 prediction (predict_type=xstart): scale input, forward, output IS x0.
+
+    `c_y` is the `lq` CONDITIONING map from make_cond_lq — NOT the residual base z_y."""
+    return model(diff._scale_input(z_t, t), t, lq=c_y, eps=eps)
+
+
+def make_cond_lq(lq_img, z_y, mode="latent"):
+    """Build the tensor fed to the UNet's `lq` conditioning input.
+
+    `lq` is NOT the residual-shift base — that's `z_y`, the VQ latent of the upsampled
+    LR, which keeps its own latent identity in the prior. `lq` is a separate 3-channel
+    map concatenated onto the latent inside the first conv, and which convention a
+    student expects depends on how it was distilled:
+
+      "pixel"  — the LR PIXELS at latent resolution, in [-1,1]. The released realsr
+                 teacher's convention (lq_size == image_size == 64 resolves the
+                 feature_extractor to nn.Identity), so students distilled after
+                 2026-07-11 inherit it and the released prior actually transfers.
+      "latent" — the VQ latent itself. Off-manifold for pixel-trained weights (x0 MSE
+                 degrades 0.004 -> 1.50 at t=14 and output comes out neon green), but
+                 correct for the x4 12k student and the whole x2 line, which were both
+                 distilled under it and are therefore self-consistent.
+
+    The mode travels in the checkpoint metadata; default "latent" so pre-2026-07-11
+    students that carry no `cond_lq` key keep their original behaviour.
+
+    lq_img: the HR-sized bicubic-upsampled LR tile in [-1,1] (post pad-to-align).
+    z_y:    the LR latent — only its spatial dims are used here.
+    """
+    if mode == "latent":
+        return z_y
+    if mode != "pixel":
+        raise ValueError(f"cond_lq mode must be 'pixel' or 'latent', got {mode!r}")
+    import torch.nn.functional as F
+    return F.interpolate(
+        lq_img.float(), size=z_y.shape[-2:], mode="bicubic", align_corners=False,
+    ).clamp(-1, 1).to(z_y.dtype)
 
 
 # ---------------------------------------------------------------------- builders
@@ -338,7 +373,7 @@ def count_tiles(H, W, chop, overlap):
 
 @torch.no_grad()
 def _sample_tile(cfg, diff, vqgan, student, hr_t, align, device, amp, generator,
-                 zT_noise=None, eps_noise=None):
+                 zT_noise=None, eps_noise=None, cond_mode="latent"):
     """One tile: reflect-pad to `align`, encode → 1-step student → decode → crop back.
     In/out (1,3,H,W) in [-1,1]. Heavy matmuls under bf16 autocast when `amp`; the VQGAN
     runs in its native (bf16 or fp32) dtype OUTSIDE autocast so GroupNorm activations
@@ -364,15 +399,19 @@ def _sample_tile(cfg, diff, vqgan, student, hr_t, align, device, amp, generator,
     eps = (make_eps(student, z_y, generator) if eps_noise is None
            else eps_noise[:, :, :hz, :wz].to(z_y.dtype))
     tT = torch.full((z_y.shape[0],), diff.num_timesteps - 1, device=device, dtype=torch.long)
+    # `lq` conditioning is NOT the residual base z_y — the convention travels in the ckpt
+    # meta (see make_cond_lq). hr_t is the padded tile, matching what z_y was encoded from.
+    c_y = make_cond_lq(hr_t, z_y, cond_mode)
     with ctx:
-        z0 = predict_x0(diff, student, z_T, z_y, tT, eps)
+        z0 = predict_x0(diff, student, z_T, c_y, tT, eps)
     img = vqgan.decode(z0.to(vdt), force_not_quantize=True).clamp(-1, 1)
     return img[:, :, :h, :w].float()
 
 
 @torch.no_grad()
 def upscale(cfg, diff, vqgan, student, lr_m1p1, device, scale, align,
-            overlap, chop, tile_batch, amp=True, seed=None, progress=None, shared_noise=True):
+            overlap, chop, tile_batch, amp=True, seed=None, progress=None, shared_noise=True,
+            cond_mode="latent"):
     """1-step student ×`scale` SR. `lr_m1p1` is (1,3,H,W) in [-1,1] at LR resolution;
     it is bicubic-upsampled ×scale first (the student is spatially same-resolution),
     then tiled with ImageSpliterTh(sf=1). Returns (1,3,H*scale,W*scale) in [-1,1].
@@ -410,12 +449,14 @@ def upscale(cfg, diff, vqgan, student, lr_m1p1, device, scale, align,
                 eps_noise = torch.cat([g_eps[:, :, h0 // f:h0 // f + lt, w0 // f:w0 // f + lt]
                                        for (h0, _, w0, _) in info], dim=0)
             spliter.update(_sample_tile(cfg, diff, vqgan, student, pch, align, device, amp, gen,
-                                        zT_noise=zt_noise, eps_noise=eps_noise), info)
+                                        zT_noise=zt_noise, eps_noise=eps_noise,
+                                        cond_mode=cond_mode), info)
             if progress is not None:
                 progress()
         img = spliter.gather()
     else:
-        img = _sample_tile(cfg, diff, vqgan, student, up, align, device, amp, gen)
+        img = _sample_tile(cfg, diff, vqgan, student, up, align, device, amp, gen,
+                           cond_mode=cond_mode)
         if progress is not None:
             progress()
     return img.clamp(-1, 1)
