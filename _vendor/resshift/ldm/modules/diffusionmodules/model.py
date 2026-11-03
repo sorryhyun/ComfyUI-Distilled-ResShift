@@ -18,11 +18,12 @@ except:
 
 # Anima SR sidecar: memory-efficient attention without xformers (Blackwell).
 # The VQGAN mid-attention is SINGLE-HEAD with head_dim=512 over a ~65k-token seq.
-# That exceeds flash/efficient SDPA kernel limits (head_dim>256) so SDPA would use
-# the O(N^2) math backend and OOM (16 GiB map). Splitting heads would change the
-# (trained) single-head math. Instead we chunk over the query axis: each block does
-# exact attention against all keys, so memory is O(Bq*N) not O(N*N) — bit-faithful.
+# Flash refuses head_dim 512; the mem-efficient kernel takes it, but only for
+# contiguous q/k/v — the permuted (b,hw,c) views from NCHW are strided and fall to
+# the math backend, which upcasts bf16 to fp32 SIMT sgemm (~40% of VQGAN enc/dec time).
+# The query-axis chunking keeps memory O(Bq*N) should math run anyway (exact).
 def _sdpa_efficient(q, k, v, q_chunk=2048):  # q,k,v: (b, L, c)
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     L = q.shape[1]
     if L <= q_chunk:
         return torch.nn.functional.scaled_dot_product_attention(q, k, v)

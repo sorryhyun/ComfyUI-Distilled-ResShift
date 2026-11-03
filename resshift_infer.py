@@ -376,7 +376,7 @@ def _sample_tile(cfg, diff, vqgan, student, hr_t, align, device, amp, generator,
                  zT_noise=None, eps_noise=None, cond_mode="latent"):
     """One tile: reflect-pad to `align`, encode → 1-step student → decode → crop back.
     In/out (1,3,H,W) in [-1,1]. Heavy matmuls under bf16 autocast when `amp`; the VQGAN
-    runs in its native (bf16 or fp32) dtype OUTSIDE autocast so GroupNorm activations
+    runs in its native (fp16 or fp32) dtype OUTSIDE autocast so GroupNorm activations
     stay in that dtype (autocast would force the full-res norms to fp32 = the VRAM peak).
 
     `zT_noise`/`eps_noise` (latent-shaped, matching z_y): a precomputed noise slice from

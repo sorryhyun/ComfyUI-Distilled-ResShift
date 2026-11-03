@@ -53,8 +53,9 @@ Large images are tiled (`ImageSpliterTh`, overlap-averaged); each tile is reflec
 a multiple of the Swin alignment (256 px at ×4, 128 px at ×2) — `chop` is snapped to that
 automatically.
 
-`bf16` runs the student under bf16 autocast and the VQGAN in native bf16 (keeping the
-full-resolution GroupNorm activations — the VRAM peak — out of fp32).
+`bf16` runs the student under bf16 autocast and the VQGAN natively in fp16 (keeping the
+full-resolution GroupNorm activations — the VRAM peak — out of fp32). fp16 runs the VQGAN at
+bf16's speed with about an eighth of its error against fp32.
 
 ## Dependencies
 

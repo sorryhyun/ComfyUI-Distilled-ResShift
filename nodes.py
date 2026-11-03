@@ -201,18 +201,20 @@ class ResShiftLoader:
 
         sd, noise_mode, noise_channels, cond_lq = _read_student(student_path)
         # Student weights stay fp32 and run under bf16 autocast (matches infer.py); the
-        # VQGAN goes native-bf16 so its full-res GroupNorm activations (the VRAM peak)
-        # aren't forced back to fp32 by autocast. In fp32 mode both stay fp32.
+        # VQGAN runs natively in fp16, outside autocast, so its full-res GroupNorm
+        # activations (the VRAM peak) stay 16-bit. fp16 over bf16: same speed, ~8x closer
+        # to fp32 (activations peak ~2.1e3, far inside fp16 range). fp32 mode: both fp32.
         student = R.build_student(cfg, offload, dtype=torch.float32,
                                   noise_mode=noise_mode, noise_channels=noise_channels)
         R.load_student_weights(student, sd)
-        vqgan = R.build_autoencoder(cfg, offload, dtype=dt)
+        vq_dt = torch.float16 if amp else dt
+        vqgan = R.build_autoencoder(cfg, offload, dtype=vq_dt)
         bundle = _RSDBundle(student, vqgan)
 
         patcher = comfy.model_patcher.ModelPatcher(bundle, load_device=load_device, offload_device=offload)
         print(f"[ResShift] loaded student ({noise_mode}/{student.noise_channels}ch, "
               f"lq={cond_lq}) + vq-f4 "
-              f"VQGAN as {dtype} (×{scale}, align={align}; ComfyUI-managed)")
+              f"VQGAN as {str(vq_dt).removeprefix('torch.')} (×{scale}, align={align}; ComfyUI-managed)")
         return (ResShiftModel(patcher, cfg, diff, scale, align, amp, cond_lq),)
 
 
